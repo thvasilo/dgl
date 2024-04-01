@@ -1,6 +1,11 @@
 import copy
 import logging
 import os
+from typing import Dict, List
+
+from joblib import Parallel, delayed
+from numba import njit, prange
+from numba.typed import List as NumbaList
 
 import numpy as np
 import pyarrow
@@ -14,7 +19,7 @@ class DistLookupService:
     """
     This is an implementation of a Distributed Lookup Service to provide the following
     services to its users. Map 1) global node-ids to partition-ids, and 2) global node-ids
-    to shuffle global node-ids (contiguous, within each node for a give node_type and across
+    to shuffle global node-ids (contiguous, within each worker for a give node_type and across
     all the partitions)
 
     This services initializes itself with the node-id to partition-id mappings, which are inputs
@@ -22,7 +27,7 @@ class DistLookupService:
     node type. These node-id-to-partition-id mappings are split within the service processes so that
     each process ends up with a contiguous chunk. It first divides the no of mappings (node-id to
     partition-id) for each node type into equal chunks across all the service processes. So each
-    service process will be thse owner of a set of node-id-to-partition-id mappings. This class
+    service process will be the owner of a set of node-id-to-partition-id mappings. This class
     has two functions which are as follows:
 
     1) `get_partition_ids` function which returns the node-id to partition-id mappings to the user
@@ -56,7 +61,7 @@ class DistLookupService:
         # These lists are indexed by ntype_ids.
         type_nid_begin = []
         type_nid_end = []
-        partid_list = []
+        partid_list = NumbaList()
         ntype_count = []
         ntypes = []
 
@@ -96,7 +101,7 @@ class DistLookupService:
             split_size = np.ceil(count / np.int64(world_size)).astype(np.int64)
             start, end = (
                 np.int64(rank) * split_size,
-                np.int64(rank + 1) * split_size,
+                np.int64(rank + 1) * split_size
             )
             if rank == (world_size - 1):
                 end = count
@@ -126,7 +131,7 @@ class DistLookupService:
     def set_idMap(self, id_map):
         self.id_map = id_map
 
-    def get_partition_ids(self, agg_global_nids):
+    def get_partition_ids(self, agg_global_nids: np.ndarray) -> List[int]:
         """
         This function is used to get the partition-ids for a given set of global node ids
 
@@ -146,9 +151,6 @@ class DistLookupService:
 
         Parameters:
         -----------
-        self : instance of this class
-            instance of this class, which is passed by the runtime implicitly
-
         agg_global_nids : numpy array
             an array of aggregated global node-ids for which partition-ids are
             to be retrieved by the distributed lookup service.
@@ -175,7 +177,7 @@ class DistLookupService:
 
         num_splits = np.ceil(max_count / CHUNK_SIZE).astype(np.uint16)
         LOCAL_CHUNK_SIZE = np.ceil(local_rows / num_splits).astype(np.int64)
-        agg_partition_ids = []
+        agg_partition_ids_list = []
 
         logging.debug(
             f"[Rank: {self.rank}] BatchSize: {CHUNK_SIZE}, \
@@ -227,11 +229,12 @@ class DistLookupService:
                 ll = global_nids[idxes[0]]
                 send_list.append(torch.from_numpy(ll))
                 indices_list.append(idxes[0])
-            assert len(np.concatenate(indices_list)) == len(global_nids)
-            assert np.all(
-                np.sort(np.concatenate(indices_list))
-                == np.arange(len(global_nids))
-            )
+            if os.environ.get('DGL_DIST_DEBUG', '0') == '1':
+                assert len(np.concatenate(indices_list)) == len(global_nids)
+                assert np.all(
+                    np.sort(np.concatenate(indices_list))
+                    == np.arange(len(global_nids))
+                )
 
             # Send the request to everyone else.
             # As a result of this operation, the current process also receives a list of lists
@@ -244,7 +247,7 @@ class DistLookupService:
 
             # Create the response list here for each of the request list received in the previous
             # step. Populate the respective partition-ids in this response lists appropriately
-            out_list = []
+            out_list = NumbaList()
             for idx in range(self.world_size):
                 if owner_req_list[idx] is None:
                     out_list.append(torch.empty((0,), dtype=torch.int64))
@@ -253,48 +256,25 @@ class DistLookupService:
                 ntype_ids, type_nids = self.id_map(owner_req_list[idx].numpy())
                 ntype_ids, type_nids = ntype_ids.numpy(), type_nids.numpy()
 
-                # Lists to store partition-ids for the incoming global-nids.
-                type_id_lookups = []
-                local_order_idx = []
-
-                # Now iterate over all the node_types and acculumulate all the partition-ids
+                # Now iterate over all the node_types and accumulate all the partition-ids
                 # since all the partition-ids are based on the node_type order... they
                 # must be re-ordered as per the order of the input, which may be different.
-                for tid in range(len(self.partid_list)):
-                    cond = ntype_ids == tid
-                    local_order_idx.append(np.where(cond)[0])
-                    global_type_nids = type_nids[cond]
-                    if len(global_type_nids) <= 0:
-                        continue
+                self.accumulate_partition_ids(
+                                out_list,
+                                self.partid_list,
+                                self.type_nid_begin,
+                                ntype_ids,
+                                type_nids
+                            )
 
-                    local_type_nids = (
-                        global_type_nids - self.type_nid_begin[tid]
-                    )
 
-                    assert np.all(local_type_nids >= 0)
-                    assert np.all(
-                        local_type_nids
-                        <= (
-                            self.type_nid_end[tid]
-                            + 1
-                            - self.type_nid_begin[tid]
-                        )
-                    )
-
-                    cur_owners = self.partid_list[tid][local_type_nids]
-                    type_id_lookups.append(cur_owners)
-
-                # Reorder the partition-ids, so that it agrees with the input order --
-                # which is the order in which the incoming message is received.
-                if len(type_id_lookups) <= 0:
-                    out_list.append(torch.empty((0,), dtype=torch.int64))
+            for list_idx, ndarray in enumerate(out_list):
+                if len(ndarray) == 0:
+                    out_list[list_idx] = torch.empty((0, ), dtype=torch.int64)
                 else:
-                    # Now reorder results for each request.
-                    sort_order_idx = np.argsort(np.concatenate(local_order_idx))
-                    lookups = np.concatenate(type_id_lookups)[sort_order_idx]
-                    out_list.append(torch.from_numpy(lookups))
-
+                    out_list[list_idx] = torch.from_numpy(ndarray)
             # Send the partition-ids to their respective requesting processes.
+            print(f"Length of out_list: {len(out_list)}")
             owner_resp_list = alltoallv_cpu(
                 self.rank, self.world_size, out_list
             )
@@ -306,36 +286,77 @@ class DistLookupService:
 
             # Order according to the requesting order.
             # Owner_resp_list is the list of owner-ids for global_nids (function argument).
-            owner_ids = [x for x in owner_resp_list if x is not None]
-            if len(owner_ids) > 0:
-                owner_ids = torch.cat(owner_ids).numpy()
-            else:
-                owner_ids = np.array([], dtype=np.int64)
-            assert len(owner_ids) == len(global_nids)
-
-            global_nids_order = np.concatenate(indices_list)
-            sort_order_idx = np.argsort(global_nids_order)
-            owner_ids = owner_ids[sort_order_idx]
-            global_nids_order = global_nids_order[sort_order_idx]
-            assert np.all(np.arange(len(global_nids)) == global_nids_order)
-
-            if len(owner_ids) > 0:
-                # Store the partition-ids for the current split
-                agg_partition_ids.append(owner_ids)
+            self.reorder_partition_ids(agg_partition_ids_list, owner_resp_list, global_nids, indices_list)
 
         # Stitch the list of partition-ids and return to the caller
-        if len(agg_partition_ids) > 0:
-            agg_partition_ids = np.concatenate(agg_partition_ids)
+        if len(agg_partition_ids_list) > 0:
+            agg_partition_ids = np.concatenate(agg_partition_ids_list)
         else:
             agg_partition_ids = np.array([], dtype=np.int64)
         assert agg_global_nids.shape[0] == agg_partition_ids.shape[0]
 
-        # Now the owner_ids (partition-ids) which corresponding to the  global_nids.
+        # Now the owner_ids (partition-ids) which corresponding to the global_nids.
         return agg_partition_ids
 
+    @staticmethod
+    @njit
+    def reorder_partition_ids(agg_partition_ids_list, owner_resp_list, global_nids, indices_list):
+        owner_ids = [x for x in owner_resp_list if x is not None]
+        if len(owner_ids) > 0:
+            owner_ids = torch.cat(owner_ids).numpy()
+        else:
+            owner_ids = np.array([], dtype=np.int64)
+        assert len(owner_ids) == len(global_nids)
+
+        global_nids_order = np.concatenate(indices_list)
+        sort_order_idx = np.argsort(global_nids_order)
+        owner_ids = owner_ids[sort_order_idx]
+        global_nids_order = global_nids_order[sort_order_idx]
+
+        if len(owner_ids) > 0:
+            # Store the partition-ids for the current split
+            agg_partition_ids_list.append(owner_ids)
+
+    @staticmethod
+    @njit()
+    def accumulate_partition_ids(
+            out_list,
+            partid_list,
+            type_nid_begin: np.ndarray,
+            ntype_ids: np.ndarray,
+            type_nids: np.ndarray):
+        out_list = []
+        # Lists to store partition-ids for the incoming global-nids.
+        type_id_lookups = np.empty(shape=(0,), dtype=np.int64)
+        local_order_idx = np.empty(shape=(0,))
+        for tid in range(len(partid_list)):
+            cond = ntype_ids == tid
+            local_order_idx = np.concatenate((local_order_idx, np.where(cond)[0]))
+            global_type_nids = type_nids[cond]
+            if len(global_type_nids) <= 0:
+                continue
+
+            local_type_nids = (
+                global_type_nids - type_nid_begin[tid]
+            )
+
+            cur_owners = partid_list[tid][local_type_nids]
+            type_id_lookups = np.concatenate((type_id_lookups, cur_owners))
+
+        # Reorder the partition-ids, so that it agrees with the input order --
+        # which is the order in which the incoming message is received.
+        if len(type_id_lookups) <= 0:
+            out_list.append(np.empty((0,), dtype=np.int64))
+        else:
+            # Now reorder results for each request.
+            sort_order_idx = np.argsort(local_order_idx)
+            lookups = type_id_lookups[sort_order_idx]
+            out_list.append(lookups)
+
+
     def get_shuffle_nids(
-        self, global_nids, my_global_nids, my_shuffle_global_nids, world_size
-    ):
+        self, global_nids: np.ndarray, my_global_nids: np.ndarray, my_shuffle_global_nids: np.ndarray, world_size: int
+    ) -> List[int]:
         """
         This function is used to retrieve shuffle_global_nids for a given set of incoming
         global_nids. Note that global_nids are of random order and will contain duplicates
@@ -403,7 +424,9 @@ class DistLookupService:
             send_list.append(torch.from_numpy(ll))
             id_list.append(idxes[0])
 
-        assert len(np.concatenate(id_list)) == len(global_nids)
+        if os.environ.get('DGL_DIST_DEBUG', '0') == '1':
+            assert len(np.concatenate(id_list)) == len(global_nids)
+
         cur_global_nids = alltoallv_cpu(self.rank, self.world_size, send_list)
 
         # At this point, current process received a list of lists each containing
@@ -418,7 +441,7 @@ class DistLookupService:
             uniq_ids, inverse_idx = np.unique(
                 cur_global_nids[idx], return_inverse=True
             )
-            common, idx1, idx2 = np.intersect1d(
+            common, _, idx2 = np.intersect1d(
                 uniq_ids,
                 my_global_nids,
                 assume_unique=True,
@@ -446,6 +469,7 @@ class DistLookupService:
         sorted_idx = np.argsort(global_nids_order)
         shuffle_global_nids = shuffle_global_nids[sorted_idx]
         global_nids_ordered = global_nids_order[sorted_idx]
-        assert np.all(global_nids_ordered == np.arange(len(global_nids)))
+        if os.environ.get('DGL_DIST_DEBUG', '0') == '1':
+            assert np.all(global_nids_ordered == np.arange(len(global_nids)))
 
         return shuffle_global_nids

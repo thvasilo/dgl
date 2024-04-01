@@ -147,7 +147,7 @@ class IdMap:
             self.num_types,
         )
         ret = utils.toindex(ret).tousertensor()
-        return ret[: len(ids)], ret[len(ids) :]
+        return ret[:len(ids)], ret[len(ids) :]
 
 
 _init_api("dgl.distributed.id_map")

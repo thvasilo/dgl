@@ -1,6 +1,3 @@
-import argparse
-import gc
-import json
 import logging
 import os
 import time
@@ -9,16 +6,13 @@ import constants
 
 import dgl
 import numpy as np
-import pandas as pd
-import pyarrow
 import torch as th
 from dgl.distributed.partition import (
     _etype_str_to_tuple,
     _etype_tuple_to_str,
     RESERVED_FIELD_DTYPE,
 )
-from pyarrow import csv
-from utils import get_idranges, memory_snapshot, read_json
+from utils import get_idranges, memory_snapshot
 
 
 def _get_unique_invidx(srcids, dstids, nids, low_mem=True):
@@ -260,6 +254,7 @@ def create_dgl_object(
         IDs for each edge type. Otherwise, ``None`` is returned.
     """
     # create auxiliary data structures from the schema object
+    overall_timer_start = time.perf_counter()
     memory_snapshot("CreateDGLObj_Begin", part_id)
     _, global_nid_ranges = get_idranges(
         schema[constants.STR_NODE_TYPE], node_typecounts
@@ -267,7 +262,9 @@ def create_dgl_object(
     _, global_eid_ranges = get_idranges(
         schema[constants.STR_EDGE_TYPE], edge_typecounts
     )
+    logging.info("Time for get_idranges: %d sec", time.perf_counter() - overall_timer_start)
 
+    id_map_timer = time.perf_counter()
     id_map = dgl.distributed.id_map.IdMap(global_nid_ranges)
 
     ntypes = [(key, global_nid_ranges[key][0, 0]) for key in global_nid_ranges]
@@ -283,22 +280,18 @@ def create_dgl_object(
     node_map_val = {ntype: [] for ntype in ntypes}
     edge_map_val = {_etype_str_to_tuple(etype): [] for etype in etypes}
 
+    logging.info("Time to get id_map and assign e/ntypes and map: %f",
+                 time.perf_counter() - id_map_timer)
     memory_snapshot("CreateDGLObj_AssignNodeData", part_id)
     shuffle_global_nids = node_data[constants.SHUFFLE_GLOBAL_NID]
-    node_data.pop(constants.SHUFFLE_GLOBAL_NID)
-    gc.collect()
 
     ntype_ids = node_data[constants.NTYPE_ID]
-    node_data.pop(constants.NTYPE_ID)
-    gc.collect()
 
     global_type_nid = node_data[constants.GLOBAL_TYPE_NID]
-    node_data.pop(constants.GLOBAL_TYPE_NID)
-    node_data = None
-    gc.collect()
 
     global_homo_nid = ntype_offset_np[ntype_ids] + global_type_nid
-    assert np.all(shuffle_global_nids[1:] - shuffle_global_nids[:-1] == 1)
+    if os.environ.get('DGL_DIST_DEBUG', '0') == '1':
+        assert np.all(shuffle_global_nids[1:] - shuffle_global_nids[:-1] == 1)
     shuffle_global_nid_range = (shuffle_global_nids[0], shuffle_global_nids[-1])
 
     # Determine the node ID ranges of different node types.
@@ -312,36 +305,25 @@ def create_dgl_object(
     # process edges
     memory_snapshot("CreateDGLObj_AssignEdgeData: ", part_id)
     shuffle_global_src_id = edge_data[constants.SHUFFLE_GLOBAL_SRC_ID]
-    edge_data.pop(constants.SHUFFLE_GLOBAL_SRC_ID)
-    gc.collect()
 
     shuffle_global_dst_id = edge_data[constants.SHUFFLE_GLOBAL_DST_ID]
-    edge_data.pop(constants.SHUFFLE_GLOBAL_DST_ID)
-    gc.collect()
 
     global_src_id = edge_data[constants.GLOBAL_SRC_ID]
-    edge_data.pop(constants.GLOBAL_SRC_ID)
-    gc.collect()
 
     global_dst_id = edge_data[constants.GLOBAL_DST_ID]
-    edge_data.pop(constants.GLOBAL_DST_ID)
-    gc.collect()
 
     global_edge_id = edge_data[constants.GLOBAL_TYPE_EID]
-    edge_data.pop(constants.GLOBAL_TYPE_EID)
-    gc.collect()
 
     etype_ids = edge_data[constants.ETYPE_ID]
-    edge_data.pop(constants.ETYPE_ID)
-    edge_data = None
-    gc.collect()
+
     logging.info(
         f"There are {len(shuffle_global_src_id)} edges in partition {part_id}"
     )
 
     # It's not guaranteed that the edges are sorted based on edge type.
     # Let's sort edges and all attributes on the edges.
-    if not np.all(np.diff(etype_ids) >= 0):
+    check_sorted_timer = time.perf_counter()
+    if not np.all(etype_ids[:-1] <= etype_ids[1:]):
         sort_idx = np.argsort(etype_ids)
         (
             shuffle_global_src_id,
@@ -358,9 +340,13 @@ def create_dgl_object(
             global_edge_id[sort_idx],
             etype_ids[sort_idx],
         )
-        assert np.all(np.diff(etype_ids) >= 0)
+        if os.environ.get('DGL_DIST_DEBUG', '0') == '1':
+            assert np.all(etype_ids[:-1] <= etype_ids[1:])
     else:
         print(f"[Rank: {part_id} Edge data is already sorted !!!")
+
+    logging.info("Time to check if etype_ids is sorted: %f",
+        time.perf_counter() - check_sorted_timer)
 
     # Determine the edge ID range of different edge types.
     edge_id_start = edgeid_offset
@@ -376,6 +362,7 @@ def create_dgl_object(
 
     # get the edge list in some order and then reshuffle.
     # Here the order of nodes is defined by the sorted order.
+    get_edge_list_timer = time.perf_counter()
     uniq_ids, idx, part_local_src_id, part_local_dst_id = _get_unique_invidx(
         shuffle_global_src_id,
         shuffle_global_dst_id,
@@ -388,6 +375,8 @@ def create_dgl_object(
             uniq_ids <= shuffle_global_nid_range[1],
         )
     )
+    logging.info("Time to get convert edge lists and get inner nodes: %f sec",
+                 time.perf_counter() - get_edge_list_timer)
 
     # get the list of indices, from inner_nodes, which will sort inner_nodes as [True, True, ...., False, False, ...]
     # essentially local nodes will be placed before non-local nodes.
@@ -401,13 +390,13 @@ def create_dgl_object(
     reshuffling of nodes (to order localy owned nodes prior to non-local nodes in a partition)
     1. Form a node_map, in this case a numpy array, which will be used to map old node-ids (pre-reshuffling)
     to post-reshuffling ids.
-    2. Once the map is created, use this map to map all the node-ids in the part_local_src_id 
+    2. Once the map is created, use this map to map all the node-ids in the part_local_src_id
     and part_local_dst_id list to their appropriate `new` node-ids (post-reshuffle order).
     3. Since only the node's order is changed, we will have to re-order nodes related information when
     creating dgl object: this includes dgl.NTYPE, dgl.NID and inner_node.
     4. Edge's order is not changed. At this point in the execution path edges are still ordered by their etype-ids.
     5. Create the dgl object appropriately and return the dgl object.
-    
+
     Here is a  simple example to understand the above flow better.
 
     part_local_nids = [0, 1, 2, 3, 4, 5]
@@ -434,6 +423,7 @@ def create_dgl_object(
     # create the mappings to generate mapped part_local_src_id and part_local_dst_id
     # This map will map from unshuffled node-ids to reshuffled-node-ids (which are ordered to prioritize
     # locally owned nodes).
+    id_reshufle_timer = time.perf_counter()
     nid_map = np.zeros(
         (
             len(
@@ -448,7 +438,10 @@ def create_dgl_object(
         nid_map[part_local_src_id],
         nid_map[part_local_dst_id],
     )
+    logging.info("Time to reshufle ids: %f sec",
+        time.perf_counter() - id_reshufle_timer)
 
+    dgl_graph_creation_start = time.perf_counter()
     # create the graph here now.
     part_graph = dgl.graph(
         data=(part_local_src_id, part_local_dst_id), num_nodes=len(uniq_ids)
@@ -479,7 +472,10 @@ def create_dgl_object(
     part_graph.ndata["inner_node"] = th.as_tensor(
         inner_nodes[reshuffle_nodes], dtype=RESERVED_FIELD_DTYPE["inner_node"]
     )
+    logging.info("Time to create dgl object: %f sec",
+        time.perf_counter() - dgl_graph_creation_start)
 
+    create_orig_ids_start = time.perf_counter()
     orig_nids = None
     orig_eids = None
     if return_orig_nids:
@@ -500,6 +496,8 @@ def create_dgl_object(
             orig_eids[_etype_tuple_to_str(etype)] = th.as_tensor(
                 global_edge_id[mask]
             )
+    logging.info("Time to create orig ids: %f sec",
+                 time.perf_counter() - create_orig_ids_start)
 
     return (
         part_graph,

@@ -1,10 +1,15 @@
-import itertools
-import operator
-
-import constants
+import logging
+import os
+from timeit import default_timer as timer
+from typing import Dict
 
 import numpy as np
 import torch
+
+from numba import njit
+from joblib import Parallel, delayed
+
+import constants
 from dist_lookup import DistLookupService
 from gloo_wrapper import allgather_sizes, alltoallv_cpu
 from utils import memory_snapshot
@@ -73,7 +78,7 @@ def get_shuffle_global_nids(rank, world_size, global_nids_ranks, node_data):
 
 
 def lookup_shuffle_global_nids_edges(
-    rank, world_size, num_parts, edge_data, id_lookup, node_data
+    rank: int, world_size: int, num_parts: int, edge_data: Dict, id_lookup: DistLookupService, node_data: Dict
 ):
     """
     This function is a helper function used to lookup shuffle-global-nids for a given set of
@@ -107,6 +112,7 @@ def lookup_shuffle_global_nids_edges(
     # Even though gloo can handle upto 10GB size of data in the outgoing messages,
     # it needs additional memory to store temporary information into the buffers which will increase
     # the memory needs of the process.
+    lookup_shuffle_start = timer()
     MILLION = 1000 * 1000
     BATCH_SIZE = 250 * MILLION
     memory_snapshot("GlobalToShuffleIDMapBegin: ", rank)
@@ -130,20 +136,33 @@ def lookup_shuffle_global_nids_edges(
         ]
 
         # Determine the no. of times each process has to send alltoall messages.
+        allgather_sizes_start = timer()
         all_sizes = allgather_sizes(
             [node_list.shape[0]], world_size, num_parts, return_sizes=True
         )
         max_count = np.amax(all_sizes)
         num_splits = max_count // BATCH_SIZE + 1
+        logging.info("Time to allgather_sizes: %f", timer() - allgather_sizes_start)
 
         # Split the message into batches and send.
+        split_and_send_start = timer()
         splits = np.array_split(node_list, num_splits)
         shuffle_mappings = []
-        for item in splits:
-            shuffle_ids = id_lookup.get_shuffle_nids(
-                item, local_nids, local_shuffle_nids, world_size
+        logging.info("Starting thread-parallel id lookup...")
+        with Parallel(n_jobs=min(16, os.cpu_count()), prefer="threads") as parallel:
+            print(f"n_jobs: {parallel.n_jobs}")
+            shuffle_mappings = parallel(
+                delayed(id_lookup.get_shuffle_nids)(
+                    item, local_nids, local_shuffle_nids, world_size
+                )
+                for item in splits
             )
-            shuffle_mappings.append(shuffle_ids)
+        # for item in splits:
+        #     shuffle_ids = id_lookup.get_shuffle_nids(
+        #         item, local_nids, local_shuffle_nids, world_size
+        #     )
+        #     shuffle_mappings.append(shuffle_ids)
+        logging.info("Time to split and send: %.2f sec", timer() - split_and_send_start)
 
         shuffle_ids = np.concatenate(shuffle_mappings)
         assert shuffle_ids.shape[0] == node_list.shape[0]
@@ -154,25 +173,29 @@ def lookup_shuffle_global_nids_edges(
         # Destination end points of edges are owned by the current node and therefore
         # should have corresponding SHUFFLE_GLOBAL_NODE_IDs.
         # Here retrieve SHUFFLE_GLOBAL_NODE_IDs for the destination end points of local edges.
-        uniq_ids, inverse_idx = np.unique(
+        unique_and_intersect = timer()
+        inverse_idx, idx2 = unique_and_intersect(
             edge_data[constants.GLOBAL_DST_ID + "/" + str(local_part_id)],
-            return_inverse=True,
-        )
-        common, idx1, idx2 = np.intersect1d(
-            uniq_ids,
             node_data[constants.GLOBAL_NID + "/" + str(local_part_id)],
-            assume_unique=True,
-            return_indices=True,
         )
-        assert len(common) == len(uniq_ids)
+        logging.info("Time to run unique and intersect: %f", timer() - unique_and_intersect)
+        # unique_and_intersect = timer()
+        # uniq_ids, inverse_idx = np.unique(
+        #     edge_data[constants.GLOBAL_DST_ID + "/" + str(local_part_id)],
+        #     return_inverse=True,
+        # )
+        # common, _, idx2 = np.intersect1d(
+        #     uniq_ids,
+        #     node_data[constants.GLOBAL_NID + "/" + str(local_part_id)],
+        #     assume_unique=True,
+        #     return_indices=True,
+        # )
+        # assert len(common) == len(uniq_ids)
+        # logging.info("Time to run unique and intersect: %f", timer() - unique_and_intersect)
 
         edge_data[
             constants.SHUFFLE_GLOBAL_DST_ID + "/" + str(local_part_id)
-        ] = node_data[constants.SHUFFLE_GLOBAL_NID + "/" + str(local_part_id)][
-            idx2
-        ][
-            inverse_idx
-        ]
+        ] = node_data[constants.SHUFFLE_GLOBAL_NID + "/" + str(local_part_id)][idx2][inverse_idx]
         assert len(
             edge_data[
                 constants.SHUFFLE_GLOBAL_DST_ID + "/" + str(local_part_id)
@@ -182,6 +205,20 @@ def lookup_shuffle_global_nids_edges(
     memory_snapshot("GlobalToShuffleIDMap_AfterLookupServiceCalls: ", rank)
     return edge_data
 
+@njit
+def unique_and_intersect(edge_part: np.ndarray, node_part: np.ndarray):
+    uniq_ids, inverse_idx = np.unique(
+        edge_part,
+        return_inverse=True,
+    )
+    _, _, idx2 = np.intersect1d(
+        uniq_ids,
+        node_part,
+        assume_unique=True,
+        return_indices=True,
+    )
+
+    return inverse_idx, idx2
 
 def assign_shuffle_global_nids_nodes(rank, world_size, num_parts, node_data):
     """
